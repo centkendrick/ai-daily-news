@@ -1,13 +1,15 @@
 import os
 import sys
 import smtplib
+import re
+import feedparser
 from email.mime.text import MIMEText
 from email.header import Header
-import feedparser
 from datetime import datetime
 from openai import OpenAI
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# 强制标准输出无缓冲，让 GitHub Actions 实时显示 print 内容
+# 强制标准输出无缓冲
 sys.stdout.reconfigure(encoding='utf-8', line_buffering=True)
 
 # 从环境变量中读取配置
@@ -16,105 +18,183 @@ SENDER_AUTH_CODE = os.getenv("SENDER_AUTH_CODE")
 RECEIVER_EMAIL = "582141970@qq.com"
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 
-def main():
-    print("========== 任务开始 ==========", flush=True)
-    
-    # 1. 检查密钥是否存在
-    if not DEEPSEEK_API_KEY:
-        print("❌ 错误：未找到 DEEPSEEK_API_KEY 环境变量，请检查 Secrets 配置！", flush=True)
-        return
-    if not SENDER_EMAIL or not SENDER_AUTH_CODE:
-        print("❌ 错误：未找到发件箱配置，请检查 SENDER_EMAIL 和 SENDER_AUTH_CODE！", flush=True)
-        return
-    
-    print(f"✅ 环境变量读取成功，收件人：{RECEIVER_EMAIL}", flush=True)
+client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
-    client = OpenAI(
-        api_key=DEEPSEEK_API_KEY,
-        base_url="https://api.deepseek.com"
-    )
+# 扩充的顶级 AI 资讯源
+RSS_URLS = [
+    "https://techcrunch.com/category/artificial-intelligence/feed/",
+    "https://venturebeat.com/category/ai/feed/",
+    "https://www.jiqizhixin.com/rss",
+    "https://www.technologyreview.com/topic/artificial-intelligence/feed",
+    "https://www.wired.com/feed/tag/ai/latest/rss",
+    "https://syncedreview.com/feed/",
+    "https://www.marktechpost.com/feed/",
+    "https://news.mit.edu/rss/topic/artificial-intelligence2",
+    "https://openai.com/news/rss.xml",
+    "https://www.artificialintelligence-news.com/feed/"
+]
 
-    print("📡 正在抓取全球科技新闻...", flush=True)
-    rss_urls = [
-        "https://techcrunch.com/feed/",
-        "https://www.theverge.com/rss/index.xml",
-        "https://www.wired.com/feed/rss",
-        "https://www.jiqizhixin.com/rss"
-    ]
-    
-    all_entries = []
-    for url in rss_urls:
+AI_KEYWORDS = ["AI", "人工智能", "大模型", "LLM", "算法", "算力", "模型", "深度学习", "AIGC", "OpenAI", "DeepSeek", "Anthropic", "Gemini", "Claude", "ChatGPT", "AGI"]
+
+def clean_html(raw_html):
+    """清理摘要中的 HTML 标签"""
+    cleanr = re.compile('<.*?>')
+    cleantext = re.sub(cleanr, '', raw_html)
+    return cleantext.strip()
+
+def fetch_and_filter_news():
+    print("📡 开始抓取全球数十个 AI 媒体源...", flush=True)
+    all_news = []
+    seen_titles = set()
+
+    for url in RSS_URLS:
         try:
-            print(f"-> 正在请求: {url}", flush=True)
             feed = feedparser.parse(url)
-            print(f"   ✅ 成功获取 {len(feed.entries)} 条", flush=True)
-            all_entries.extend(feed.entries[:5])
+            source_name = feed.feed.get('title', url.split("//")[1].split("/")[0])
+            for entry in feed.entries:
+                title = entry.title
+                if title in seen_titles: continue
+                
+                raw_summary = entry.get('summary', '')
+                summary = clean_html(raw_summary)[:250]
+                full_text = title + summary
+                link = entry.get('link', '#')
+                
+                # 过滤非 AI 新闻
+                if any(keyword in full_text for keyword in AI_KEYWORDS):
+                    all_news.append({
+                        "title": title,
+                        "summary": summary,
+                        "link": link,
+                        "source": source_name
+                    })
+                    seen_titles.add(title)
         except Exception as e:
-            print(f"   ❌ 抓取失败: {e}", flush=True)
-            
-    if not all_entries:
-        print("⚠️ 未抓取到任何新闻，任务终止。", flush=True)
-        return
+            print(f"❌ 抓取失败 {url}: {e}", flush=True)
 
-    print("🧠 正在调用 DeepSeek-Reasoner 进行深度推演...", flush=True)
+    print(f"✅ 成功获取并去重，共筛选出 {len(all_news)} 条纯 AI 新闻。", flush=True)
+    return all_news
+
+def analyze_batch(batch, batch_index):
+    """处理一批新闻（每批5条），调用 Reasoner"""
+    if not batch: return ""
+    
     news_text = ""
-    for i, entry in enumerate(all_entries[:12]):
-        title = entry.title
-        summary = entry.get('summary', '')[:200].replace('\n', ' ')
-        news_text += f"【新闻{i+1}】\n标题：{title}\n摘要：{summary}\n---\n"
+    for i, n in enumerate(batch):
+        news_text += f"【新闻{i+1}】\n标题：{n['title']}\n摘要：{n['summary']}\n---\n"
 
     prompt = f"""
     【角色】：你是一位顶级的全球科技与商业分析师。
-    【任务】：请阅读以下最新抓取的全球科技新闻（中英文混合），提炼出 4-5 条最有价值的核心动向。
-    【分析要求】：
-    1. **事件核心（中英对照）**：用中文简述事件，并保留关键英文专业词汇或原文摘要。
-    2. **商业化机会**：这给创业者、投资人或企业带来了什么赚钱/降本的机会？请给出具体场景。
-    3. **潜在风险**：这件事可能带来什么政策、安全、伦理或商业上的风险？
-    
+    【任务】：请阅读以下 {len(batch)} 条新闻，提炼出最有价值的动向。如果不包含真正的 AI 核心进展，请直接跳过。
+    【分析要求】：针对每条有价值的新闻，输出：
+    1. **事件核心**：请直接用纯中文简述事件，不要包含英文原文。
+    2. **商业化机会**：给创业者或企业带来什么赚钱/降本机会？请给具体场景。
+    3. **潜在风险**：政策、安全、伦理或商业风险。
+
     【新闻数据】：
     {news_text}
-    
-    【输出格式要求】：
-    请直接输出排版精美的 HTML 内容（千万不要输出 ```html 等 Markdown 标记，只输出纯 HTML 标签），以便直接渲染到邮件里。
-    请严格使用以下结构：
-    <h3 style="color: #2c3e50;">1. [动向标题]</h3>
-    <ul>
-        <li><strong>事件核心：</strong>...</li>
-        <li><strong>商业化机会：</strong><span style="color: green;">...</span></li>
-        <li><strong>潜在风险：</strong><span style="color: red;">...</span></li>
-    </ul>
+
+    【输出格式】：严格输出 HTML，不要 Markdown 标记。
+    <div class="news-card">
+        <h3>[动向标题]</h3>
+        <p><strong>事件核心：</strong>...</p>
+        <p class="opportunity"><strong>💰 商业化机会：</strong>...</p>
+        <p class="risk"><strong>⚠️ 潜在风险：</strong>...</p>
+    </div>
     """
     
     try:
+        print(f"🧠 正在请求大模型分析第 {batch_index + 1} 组新闻...", flush=True)
         response = client.chat.completions.create(
-            model="deepseek-reasoner", 
+            model="deepseek-reasoner",
             messages=[{"role": "user", "content": prompt}]
         )
         html_content = response.choices[0].message.content
-        print("✅ AI 深度分析完成！", flush=True)
+        return html_content.replace("```html", "").replace("```", "").strip()
     except Exception as e:
-        print(f"❌ 调用 AI 失败: {e}", flush=True)
+        print(f"❌ 第 {batch_index + 1} 组分析失败: {e}", flush=True)
+        return ""
+
+def main():
+    print("========== 任务开始 ==========", flush=True)
+    
+    if not DEEPSEEK_API_KEY or not SENDER_EMAIL:
+        print("❌ 错误：环境变量未配置！", flush=True)
         return
 
-    print(f"✉️ 正在发送邮件到 {RECEIVER_EMAIL}...", flush=True)
+    news_list = fetch_and_filter_news()
+    if not news_list:
+        return
+
+    # 将新闻分组，每 5 条一组，避免大模型过载
+    batch_size = 5
+    batches = [news_list[i:i + batch_size] for i in range(0, len(news_list), batch_size)]
+
+    # 使用多线程并发请求，加快处理几十条新闻的速度
+    analyzed_html_blocks = []
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = {executor.submit(analyze_batch, batch, idx): idx for idx, batch in enumerate(batches)}
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                analyzed_html_blocks.append(result)
+
+    if not analyzed_html_blocks:
+        print("⚠️ 所有 AI 分析均失败，任务终止。", flush=True)
+        return
+
+    # 拼接所有分析好的新闻卡片
+    final_news_html = "\n".join(analyzed_html_blocks)
     
+    # 构建新闻来源和原文链接的补充信息
+    source_links_html = "<h3 style='color:#2c3e50; border-bottom:1px solid #ccc; padding-bottom:10px;'>🔗 原文与来源汇总</h3><ul>"
+    for n in news_list:
+        source_links_html += f"<li><strong>{n['source']}</strong> - <a href='{n['link']}' style='color:#3498db; text-decoration:none;'>{n['title']}</a></li>"
+    source_links_html += "</ul>"
+
+    # 终极 HTML 模板
     final_html = f"""
+    <!DOCTYPE html>
     <html>
-    <body style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
-        <h2 style="color: #1a73e8; border-bottom: 2px solid #1a73e8; padding-bottom: 10px;">
-            🌍 全球 AI 动向与商业情报日报 ({datetime.now().strftime("%Y-%m-%d")})
-        </h2>
-        <p>你好！这是为你自动生成的今日 AI 圈深度分析报告。</p>
-        <hr>
-        {html_content}
-        <hr>
-        <p style="font-size: 12px; color: #888;">由 DeepSeek-Reasoner 与 GitHub Actions 自动驱动。</p>
+    <head>
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif; background-color: #f4f7f6; color: #333; line-height: 1.6; margin: 0; padding: 20px; }}
+            .container {{ max-width: 750px; margin: 0 auto; background: #ffffff; border-radius: 12px; padding: 30px; box-shadow: 0 4px 15px rgba(0,0,0,0.05); }}
+            .header {{ text-align: center; border-bottom: 2px solid #eaeaea; padding-bottom: 20px; margin-bottom: 30px; }}
+            .header h1 {{ color: #2c3e50; margin: 0; font-size: 26px; }}
+            .news-card {{ background: #f9fbfc; border-left: 4px solid #3498db; border-radius: 6px; padding: 20px; margin-bottom: 25px; box-shadow: 0 2px 5px rgba(0,0,0,0.02); }}
+            .news-card h3 {{ margin-top: 0; color: #2980b9; font-size: 18px; }}
+            .news-card p {{ margin: 10px 0; font-size: 15px; }}
+            .opportunity {{ color: #27ae60; background: #eafaf1; padding: 12px; border-radius: 6px; border-left: 3px solid #27ae60; }}
+            .risk {{ color: #c0392b; background: #fdedec; padding: 12px; border-radius: 6px; border-left: 3px solid #c0392b; }}
+            .footer {{ text-align: center; color: #bdc3c7; font-size: 12px; margin-top: 40px; border-top: 1px solid #eaeaea; padding-top: 20px; }}
+            a {{ color: #3498db; }}
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <div class="header">
+                <h1>🌍 全球 AI 动向与商业情报日报</h1>
+                <p>{datetime.now().strftime("%Y年%m月%d日")} | 共精选 {len(analyzed_html_blocks)} 组核心动向</p>
+            </div>
+            
+            {final_news_html}
+            
+            <hr style="border:0; border-top:1px dashed #ccc; margin: 30px 0;">
+            {source_links_html}
+            
+            <div class="footer">
+                由 DeepSeek-Reasoner 与 GitHub Actions 自动驱动。<br>
+                数据来源：TechCrunch, 机器之心, Wired, MIT News 等全球顶级媒体。
+            </div>
+        </div>
     </body>
     </html>
     """
-    
+
+    print(f"✉️ 正在发送邮件到 {RECEIVER_EMAIL}...", flush=True)
     mail_msg = MIMEText(final_html, 'html', 'utf-8')
-    mail_msg['Subject'] = Header(f'【AI 日报】{datetime.now().strftime("%Y-%m-%d")} 全球动向与商业分析', 'utf-8')
+    mail_msg['Subject'] = Header(f'【AI 日报】{datetime.now().strftime("%m-%d")} 数十条全球动向精选', 'utf-8')
     mail_msg['From'] = SENDER_EMAIL
     mail_msg['To'] = RECEIVER_EMAIL
 
